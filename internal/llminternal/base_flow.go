@@ -46,6 +46,7 @@ import (
 	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/authconsent"
 	"google.golang.org/adk/v2/tool/toolconfirmation"
 )
 
@@ -87,7 +88,7 @@ var (
 	DefaultRequestProcessors = []func(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error]{
 		basicRequestProcessor,
 		toolProcessor,
-		authPreprocessor,
+		RequestCredentialRequestProcessor,
 		RequestConfirmationRequestProcessor,
 		instructionsRequestProcessor,
 		identityRequestProcessor,
@@ -674,7 +675,7 @@ func (f *Flow) RunLive(ctx agent.InvocationContext) (agent.LiveSession, iter.Seq
 						}
 					}
 					if len(fnCalls) > 0 {
-						respEv, err := f.handleFunctionCalls(ctx, tools, &ev.LLMResponse, nil, sess)
+						respEv, err := f.handleFunctionCalls(ctx, tools, &ev.LLMResponse, nil, nil, sess)
 						if err != nil {
 							sess.pushError(err)
 							cleanup()
@@ -830,7 +831,7 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 			}
 			// Handle function calls.
 
-			ev, err := f.handleFunctionCalls(ctx, tools, resp.LLMResponse, nil, nil)
+			ev, err := f.handleFunctionCalls(ctx, tools, resp.LLMResponse, nil, nil, nil)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -841,15 +842,22 @@ func (f *Flow) runOneStep(ctx agent.InvocationContext) iter.Seq2[*session.Event,
 			}
 
 			toolConfirmationEvent := generateRequestConfirmationEvent(ctx, modelResponseEvent, ev)
+			requestCredentialEvent := generateRequestCredentialEvent(ctx, modelResponseEvent, ev)
 
-			// Yield function responses before confirmation requests so consumers that
-			// pause for user approval still persist completed tool results.
+			// Yield function responses before confirmation and consent requests so
+			// consumers that pause for user input still persist completed tool results.
 			if !yield(ev, nil) {
 				return
 			}
 
 			if toolConfirmationEvent != nil {
 				if !yield(toolConfirmationEvent, nil) {
+					return
+				}
+			}
+
+			if requestCredentialEvent != nil {
+				if !yield(requestCredentialEvent, nil) {
 					return
 				}
 			}
@@ -1331,7 +1339,7 @@ func marshalJSONNoHTMLEscape(v any) ([]byte, error) {
 //
 // TODO: accept filters to include/exclude function calls.
 // TODO: check feasibility of running tool.Run concurrently.
-func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[string]tool.Tool, resp *model.LLMResponse, toolConfirmations map[string]*toolconfirmation.ToolConfirmation, liveSess agent.LiveSession) (mergedEvent *session.Event, err error) {
+func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[string]tool.Tool, resp *model.LLMResponse, toolConfirmations map[string]*toolconfirmation.ToolConfirmation, authResponses map[string]*authconsent.AuthConfig, liveSess agent.LiveSession) (mergedEvent *session.Event, err error) {
 	fnCalls := utils.FunctionCalls(resp.Content)
 	toolNames := slices.Collect(maps.Keys(toolsDict))
 
@@ -1363,6 +1371,8 @@ func (f *Flow) handleFunctionCalls(ctx agent.InvocationContext, toolsDict map[st
 				confirmation = toolConfirmations[fnCall.ID]
 			}
 			toolCtx := agent.NewToolContext(toolCallCtx, fnCall.ID, &session.EventActions{StateDelta: make(map[string]any)}, confirmation)
+			// Thread the interactive OAuth consent response on the resume path.
+			toolCtx = agent.WithCredentialResponse(toolCtx, authResponses[fnCall.ID])
 
 			var result map[string]any
 			var curTool tool.Tool
@@ -1701,6 +1711,12 @@ func mergeEventActions(base, other *session.EventActions) *session.EventActions 
 			base.RequestedToolConfirmations = make(map[string]toolconfirmation.ToolConfirmation)
 		}
 		maps.Copy(base.RequestedToolConfirmations, other.RequestedToolConfirmations)
+	}
+	if other.RequestedCredentials != nil {
+		if base.RequestedCredentials == nil {
+			base.RequestedCredentials = make(map[string]authconsent.AuthConfig)
+		}
+		maps.Copy(base.RequestedCredentials, other.RequestedCredentials)
 	}
 	return base
 }
